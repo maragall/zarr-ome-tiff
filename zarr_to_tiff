@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+
+import numpy as np
+import tifffile
+from typing import Dict, Any
+from ome_zarr.io import parse_url
+from ome_zarr.reader import Reader
+
+def convert_zarr_to_ome_tiff(zarr_path: str, output_path: str):
+    """Convert OME-Zarr to OME-TIFF preserving all channel metadata"""
+    print(f"Converting {zarr_path} to {output_path}")
+    
+    # Open OME-Zarr using ome-zarr-py
+    store = parse_url(zarr_path, mode='r')
+    reader = Reader(store)
+    nodes = list(reader())
+    
+    if not nodes:
+        raise ValueError("No image data found in Zarr file")
+    
+    # Get the first (and typically only) image
+    image_node = nodes[0]
+    image_data = image_node.data[0]  # Level 0 (highest resolution)
+    metadata = image_node.metadata
+    
+    print(f"Loaded data shape: {image_data.shape}")
+    print(f"Data type: {image_data.dtype}")
+    
+    # Extract channel information from metadata
+    channel_names = []
+    channel_colors = []
+    
+    if 'channel_names' in metadata:
+        channel_names = metadata['channel_names']
+        print(f"Found channel names: {channel_names}")
+    elif 'omero' in metadata and 'channels' in metadata['omero']:
+        for ch in metadata['omero']['channels']:
+            channel_names.append(ch.get('label', 'Unknown'))
+            color_hex = ch.get('color', 'FFFFFF')
+            channel_colors.append(f"#{color_hex}")
+    else:
+        # Fallback if no metadata
+        num_channels = image_data.shape[1] if len(image_data.shape) > 3 else 1
+        channel_names = [f"Channel_{i+1}" for i in range(num_channels)]
+        channel_colors = ['#FFFFFF'] * num_channels
+    
+    # Extract colormap information if available
+    if 'colormap' in metadata and len(metadata['colormap']) == len(channel_names):
+        print("Found colormap information in metadata")
+        # Colormap format: [[[0,0,0], [R,G,B]], ...] - we want the second color
+        for colormap in metadata['colormap']:
+            if len(colormap) >= 2:
+                rgb = colormap[1]  # Second color (the actual channel color)
+                # Convert RGB float values to hex
+                r = int(rgb[0] * 255)
+                g = int(rgb[1] * 255) 
+                b = int(rgb[2] * 255)
+                hex_color = f"{r:02X}{g:02X}{b:02X}"
+                channel_colors.append(hex_color)
+    
+    if not channel_colors:
+        channel_colors = ['FFFFFF'] * len(channel_names)
+    
+    print(f"Channels: {channel_names}")
+    print(f"Channel colors: {channel_colors}")
+    
+    # Process data: convert from 5D TCZYX to 3D CYX
+    if len(image_data.shape) == 5:
+        # Data comes in as TCZYX from Zarr - (1, 4, 1, 15421, 13418)
+        print(f"Original TCZYX data shape: {image_data.shape}")
+        
+        # Transpose to CTZYX: (1,4,1,Y,X) -> (4,1,1,Y,X)
+        image_data = np.transpose(image_data, (1, 0, 2, 3, 4))
+        
+        # Squeeze out singleton T and Z dimensions: (4,1,1,Y,X) -> (4,Y,X)
+        image_data = image_data[:, 0, 0, :, :]
+        print(f"Squeezed to CYX shape: {image_data.shape}")
+    
+    # Extract physical pixel sizes if available
+    physical_size_x = physical_size_y = None
+    if 'coordinateTransformations' in metadata and len(metadata['coordinateTransformations']) > 0:
+        transforms = metadata['coordinateTransformations'][0]
+        for transform in transforms:
+            if transform.get('type') == 'scale' and 'scale' in transform:
+                scale = transform['scale']
+                if len(scale) >= 5:  # TCZYX format
+                    physical_size_x = scale[4]  # X
+                    physical_size_y = scale[3]  # Y
+                    print(f"Physical pixel size: {physical_size_x} x {physical_size_y} µm")
+                break
+    
+    # Save as OME-TIFF
+    # Note: We only pass 'axes' in metadata. tifffile infers SizeC, SizeT, SizeZ from the shape and axes
+    print(f"Writing OME-TIFF with shape {image_data.shape} and axes='CYX'")
+    tifffile.imwrite(
+        output_path,
+        image_data,
+        ome=True,
+        photometric='minisblack',
+        metadata={'axes': 'CYX'}
+    )
+    print(f"Saved OME-TIFF with {len(channel_names)} channels: {output_path}")
+    print("Conversion complete!")
+
+def main():
+    # Configuration
+    zarr_path = "Path/to/your/input.ome.zarr"
+    output_path = "/Path/to/your/output.ome.tiff"
+    
+    # Convert Zarr to OME-TIFF
+    convert_zarr_to_ome_tiff(zarr_path, output_path)
+
+if __name__ == "__main__":
+    main()
+
